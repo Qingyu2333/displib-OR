@@ -11,7 +11,7 @@ def solve_displib_instance(json_path):
     trains = data["trains"]
     objectives = data.get("objective", [])
 
-    # ===== 构建操作数据 =====
+    # ===== Build global operation list =====
     operations = []
     op_id = 0
     op_map = {}
@@ -33,7 +33,7 @@ def solve_displib_instance(json_path):
     model = cp_model.CpModel()
     horizon = 10000
 
-    # ===== 创建变量 =====
+    # ===== Create variables =====
     start_vars = {}
     end_vars = {}
     intervals = {}
@@ -47,7 +47,7 @@ def solve_displib_instance(json_path):
         end_vars[op_id] = e
         intervals[op_id] = interval
 
-    # ===== successor 顺序约束（基础） =====
+    # ===== Basic successor precedence constraints =====
     for op in operations:
         pred = op["id"]
         for succ in op["successors"]:
@@ -59,7 +59,7 @@ def solve_displib_instance(json_path):
                 if succ_id is not None:
                     model.Add(start_vars[succ_id] >= end_vars[pred])
 
-    # ===== successor 选择变量（多路径） =====
+    # ===== Successor selection variables (multi-path structure) =====
     successor_choice_vars = defaultdict(dict)
     for op in operations:
         t = op["train"]
@@ -85,27 +85,21 @@ def solve_displib_instance(json_path):
         if y_vars:
             model.Add(sum(y_vars) == 1)
 
-    # ===== 添加互斥路径选择约束（路径冲突排他性） =====
-    # 如果两个操作的 successor 是同一个资源区段（比如 r3 → r4），不能都选
+    # ===== Mutual exclusion for conflicting successor paths =====
     conflict_pairs = []
-
-    # 可选：你也可以读取 JSON 的 conflict_pair 字段（如果定义了）
-    # 这里只是静态构建一些冲突对（示意）
     for (t1, j1), succs1 in successor_choice_vars.items():
         for (t2, j2), succs2 in successor_choice_vars.items():
             if (t1, j1) >= (t2, j2):
-                continue  # 避免重复
+                continue
             for succ_idx1, y1 in succs1.items():
                 for succ_idx2, y2 in succs2.items():
-                    # 如果 successor 是同一资源（例如都在用 r3 → r4）
                     res1 = operations[op_map[(t1, j1)]]["resources"]
                     res2 = operations[op_map[(t2, j2)]]["resources"]
                     common = set(res1) & set(res2)
                     if common:
-                        # 添加互斥约束
                         model.AddBoolOr([y1.Not(), y2.Not()])
 
-    # ===== 路径完整性（连续性）约束 =====
+    # ===== Path continuity constraint =====
     for op in operations:
         if op["op_idx"] == 0:
             continue
@@ -116,7 +110,7 @@ def solve_displib_instance(json_path):
             curr_id = op_map[curr_key]
             model.Add(start_vars[curr_id] >= end_vars[pred_id])
 
-    # ===== 资源冲突 + headway =====
+    # ===== Resource conflict + headway constraints =====
     headway = 3
     resource_to_ops = defaultdict(list)
     for op in operations:
@@ -132,7 +126,7 @@ def solve_displib_instance(json_path):
                 model.Add(start_vars[a] + operations[a]["min_duration"] + headway <= start_vars[b]).OnlyEnforceIf(bvar)
                 model.Add(start_vars[b] + operations[b]["min_duration"] + headway <= start_vars[a]).OnlyEnforceIf(bvar.Not())
 
-    # ===== 资源释放时间约束（release_time） =====
+    # ===== Release time constraints =====
     for res, op_ids in resource_to_ops.items():
         for i in range(len(op_ids)):
             for j in range(i + 1, len(op_ids)):
@@ -153,12 +147,12 @@ def solve_displib_instance(json_path):
                 model.Add(start_vars[a] + operations[a]["min_duration"] + release_a <= start_vars[b]).OnlyEnforceIf(bvar)
                 model.Add(start_vars[b] + operations[b]["min_duration"] + release_b <= start_vars[a]).OnlyEnforceIf(bvar.Not())
 
-    # ===== 站台容量约束（禁止资源重叠） =====
+    # ===== Platform capacity constraint (no overlap) =====
     for res, op_ids in resource_to_ops.items():
         res_intervals = [intervals[op_id] for op_id in op_ids]
         model.AddNoOverlap(res_intervals)
 
-    # ===== 目标函数：op_delay + increment 支持 =====
+    # ===== Objective function: delay penalty + increment support =====
     penalties = []
     for obj in objectives:
         if obj["type"] == "op_delay":
@@ -197,11 +191,11 @@ def solve_displib_instance(json_path):
     else:
         total_penalty = None
 
-    # ===== 求解模型 =====
+    # ===== Solve =====
     solver = cp_model.CpSolver()
     status = solver.Solve(model)
 
-    # ===== 输出结果 =====
+    # ===== Output results =====
     results = {"events": [], "objective_value": None}
     if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
         for op in operations:
@@ -214,12 +208,3 @@ def solve_displib_instance(json_path):
         results["objective_value"] = solver.Value(total_penalty) if total_penalty is not None else 0
 
     return results
-
-
-# ===== 主程序入口 =====
-if __name__ == "__main__":
-    for name in ["headway1", "swapping1", "swapping2", "infeasible1", "infeasible2"]:
-        path = f"/Users/wendyli/Downloads/displib_instances_testing/displib_instances_testing/displib_testinstances_{name}.json"
-        print(f"\n📄 Solving: {name}")
-        result = solve_displib_instance(path)
-        print(json.dumps(result, indent=2))
