@@ -1,20 +1,37 @@
+import os
 import json
 from ortools.sat.python import cp_model
 from collections import defaultdict
 
+def add_path_segment_conflict_intervals(model, operations, start_vars):
+    segment_to_intervals = defaultdict(list)
+    for op in operations:
+        res = op["resources"]
+        if len(res) >= 2:
+            for i in range(len(res) - 1):
+                segment = (res[i], res[i + 1])
+                interval = model.NewIntervalVar(
+                    start_vars[op["id"]],
+                    op["min_duration"],
+                    start_vars[op["id"]] + op["min_duration"],
+                    f"pathseg_interval_train{op['train']}_op{op['op_idx']}_{i}"
+                )
+                segment_to_intervals[segment].append(interval)
+    for segment, intervals in segment_to_intervals.items():
+        if len(intervals) > 1:
+            model.AddNoOverlap(intervals)
+
 def solve_displib_instance(json_path):
-    # 读取JSON数据
     with open(json_path, "r") as f:
         data = json.load(f)
 
     trains = data["trains"]
     objectives = data.get("objective", [])
 
-
-    # ===== 构建全局操作列表 =====
+    # Build global operation list
     operations = []
     op_id = 0
-    op_map = {}  # 映射 (train_idx, op_idx) -> global op id
+    op_map = {}
     for t_idx, train in enumerate(trains):
         for o_idx, op in enumerate(train):
             operations.append({
@@ -24,7 +41,6 @@ def solve_displib_instance(json_path):
                 "min_duration": op["min_duration"],
                 "start_lb": op.get("start_lb", 0),
                 "start_ub": op.get("start_ub", 9999),
-                # resources字段：取每个资源的名称，release_time在JSON中单独定义（如果有）
                 "resources": [r["resource"] for r in op.get("resources", [])],
                 "release_times": [r.get("release_time", 0) for r in op.get("resources", [])],
                 "successors": op.get("successors", [])
@@ -33,12 +49,12 @@ def solve_displib_instance(json_path):
             op_id += 1
 
     model = cp_model.CpModel()
-    horizon = 10000  # 时间上界
+    horizon = 10000
 
-    # ===== 创建变量 =====
-    start_vars = {}   # 操作开始时间变量
-    end_vars = {}     # 操作结束时间变量
-    intervals = {}    # 用于资源不重叠约束的区间变量
+    # Create variables: start, end, and interval for each operation
+    start_vars = {}
+    end_vars = {}
+    intervals = {}
     for op in operations:
         oid = op["id"]
         s = model.NewIntVar(op["start_lb"], op["start_ub"], f"start_{oid}")
@@ -49,8 +65,7 @@ def solve_displib_instance(json_path):
         end_vars[oid] = e
         intervals[oid] = interval
 
-    # ===== 基础后继顺序约束 =====
-    # 若Op2为Op1的后继，则要求： start(Op2) ≥ end(Op1)
+    # Precedence constraints
     for op in operations:
         pred = op["id"]
         for succ in op["successors"]:
@@ -62,7 +77,7 @@ def solve_displib_instance(json_path):
                 if succ_id is not None:
                     model.Add(start_vars[succ_id] >= end_vars[pred])
 
-    # ===== 多路径选择变量（若有多个后继选项，仅选择一条） =====
+    # Path selection logic
     successor_choice_vars = defaultdict(dict)
     for op in operations:
         t = op["train"]
@@ -75,7 +90,6 @@ def solve_displib_instance(json_path):
             if isinstance(succ, str) and "_" in succ:
                 parts = succ[1:].split("_")
                 succ_train, succ_idx = int(parts[0]), int(parts[1])
-                # 只考虑同一列车内的多路径情况
                 if succ_train != t:
                     continue
                 succ_id = op_map.get((succ_train, succ_idx))
@@ -83,14 +97,12 @@ def solve_displib_instance(json_path):
                     y_var = model.NewBoolVar(f"y_{t}_{j}_{succ_idx}")
                     successor_choice_vars[(t, j)][succ_idx] = y_var
                     y_vars.append(y_var)
-                    # 若选中该后继，则添加额外延时（extra_delay），用于调节路径选择产生的延迟
-                    extra_delay = 5 # 这里可根据实际需要设置，比如对于swapping实例可设为非0值
+                    extra_delay = 5
                     model.Add(start_vars[succ_id] >= end_vars[op["id"]] + extra_delay).OnlyEnforceIf(y_var)
         if y_vars:
             model.Add(sum(y_vars) == 1)
 
-    # ===== 互斥路径选择约束 =====
-    # 如果两个操作的后继选择共享相同的资源，则不能同时选择
+    # Mutual exclusion for selected successor paths
     for (t1, j1), succs1 in successor_choice_vars.items():
         for (t2, j2), succs2 in successor_choice_vars.items():
             if (t1, j1) >= (t2, j2):
@@ -99,24 +111,20 @@ def solve_displib_instance(json_path):
                 for succ_idx2, y2 in succs2.items():
                     res1 = operations[op_map[(t1, j1)]]["resources"]
                     res2 = operations[op_map[(t2, j2)]]["resources"]
-                    common = set(res1) & set(res2)
-                    if common:
+                    if set(res1) & set(res2):
                         model.AddBoolOr([y1.Not(), y2.Not()])
 
-    # ===== 路径连续性约束 =====
-    # 同一列车内连续操作必须依次执行
+    # Train internal path continuity
     for op in operations:
         if op["op_idx"] == 0:
             continue
         prev_key = (op["train"], op["op_idx"] - 1)
         curr_key = (op["train"], op["op_idx"])
         if prev_key in op_map and curr_key in op_map:
-            pred_id = op_map[prev_key]
-            curr_id = op_map[curr_key]
-            model.Add(start_vars[curr_id] >= end_vars[pred_id])
+            model.Add(start_vars[op_map[curr_key]] >= end_vars[op_map[prev_key]])
 
-    # ===== 资源冲突与Headway约束 =====
-    headway = 3  # 安全间隔
+    # Resource conflict with headway
+    headway = 0
     resource_to_ops = defaultdict(list)
     for op in operations:
         for r in op["resources"]:
@@ -125,32 +133,35 @@ def solve_displib_instance(json_path):
     for res, ops in resource_to_ops.items():
         for i in range(len(ops)):
             for j in range(i + 1, len(ops)):
-                a = ops[i]
-                b = ops[j]
-                order_bool = model.NewBoolVar(f"order_{a}_{b}")
-                model.Add(start_vars[a] + operations[a]["min_duration"] + headway <= start_vars[b]).OnlyEnforceIf(order_bool)
-                model.Add(start_vars[b] + operations[b]["min_duration"] + headway <= start_vars[a]).OnlyEnforceIf(order_bool.Not())
+                a, b = ops[i], ops[j]
+                bvar = model.NewBoolVar(f"order_{a}_{b}")
+                model.Add(start_vars[a] + operations[a]["min_duration"] + headway <= start_vars[b]).OnlyEnforceIf(bvar)
+                model.Add(start_vars[b] + operations[b]["min_duration"] + headway <= start_vars[a]).OnlyEnforceIf(bvar.Not())
 
-    # ===== 资源释放时间约束（Release time） =====
-    # 考虑每个操作在释放资源后，资源才可供下一个操作使用的延时
+    # No-overlap constraints
+    for res, op_ids in resource_to_ops.items():
+        model.AddNoOverlap([intervals[oid] for oid in op_ids])
+
+    # Release time constraints
     for res, op_ids in resource_to_ops.items():
         for i in range(len(op_ids)):
             for j in range(i + 1, len(op_ids)):
-                a = op_ids[i]
-                b = op_ids[j]
-                # 默认释放时间为0，如JSON中定义了则使用其值
+                a, b = op_ids[i], op_ids[j]
                 release_a = operations[a]["release_times"][operations[a]["resources"].index(res)] if res in operations[a]["resources"] else 0
                 release_b = operations[b]["release_times"][operations[b]["resources"].index(res)] if res in operations[b]["resources"] else 0
                 rel_bool = model.NewBoolVar(f"release_conflict_{a}_{b}_res_{res}")
                 model.Add(start_vars[a] + operations[a]["min_duration"] + release_a <= start_vars[b]).OnlyEnforceIf(rel_bool)
                 model.Add(start_vars[b] + operations[b]["min_duration"] + release_b <= start_vars[a]).OnlyEnforceIf(rel_bool.Not())
 
-    # ===== 站台容量约束（No overlap） =====
-    for res, op_ids in resource_to_ops.items():
-        res_intervals = [intervals[oid] for oid in op_ids]
-        model.AddNoOverlap(res_intervals)
+    # Segment conflict constraint
+    add_path_segment_conflict_intervals(model, operations, start_vars)
 
-    # ===== 目标函数：最小化关键操作延迟（Delay penalty + increment） =====
+    # Global priority constraint: train 0 op1 must precede train 1 op1
+    buffer = 5
+    if (0, 1) in op_map and (1, 1) in op_map:
+        model.Add(start_vars[op_map[(1, 1)]] >= end_vars[op_map[(0, 1)]] + buffer)
+
+    # Objective function: delay penalty
     penalties = []
     for obj in objectives:
         if obj["type"] == "op_delay":
@@ -162,7 +173,6 @@ def solve_displib_instance(json_path):
             threshold = obj.get("threshold", 0)
             coeff = obj.get("coeff", 1)
             increment = obj.get("increment", 0)
-            # 计算延迟 = max(0, start - threshold)
             delay = model.NewIntVar(0, horizon, f"delay_{op_id}")
             model.Add(delay >= start - threshold)
             model.Add(delay >= 0)
@@ -184,14 +194,11 @@ def solve_displib_instance(json_path):
         total_penalty = model.NewIntVar(0, horizon * len(penalties), "total_penalty")
         model.Add(total_penalty == sum(penalties))
         model.Minimize(total_penalty)
-    else:
-        total_penalty = None
 
-    # ===== 求解模型 =====
     solver = cp_model.CpSolver()
     status = solver.Solve(model)
+    print(f"⏱ Solver wall time: {solver.WallTime():.3f} seconds")
 
-    # ===== 输出结果 =====
     results = {"events": [], "objective_value": None}
     if status in [cp_model.OPTIMAL, cp_model.FEASIBLE]:
         for op in operations:
@@ -201,12 +208,12 @@ def solve_displib_instance(json_path):
                 "time": solver.Value(start_vars[op["id"]])
             })
         results["events"].sort(key=lambda x: x["time"])
-        results["objective_value"] = solver.Value(total_penalty) if total_penalty is not None else 0
+        results["objective_value"] = solver.Value(total_penalty)
 
     return results
 
 
-# ===== 主程序入口 =====
+# Main entry point
 if __name__ == "__main__":
     for name in ["headway1", "swapping1", "swapping2", "infeasible1", "infeasible2"]:
         path = f"/Users/wendyli/Downloads/displib_instances_testing/displib_instances_testing/displib_testinstances_{name}.json"
@@ -214,24 +221,3 @@ if __name__ == "__main__":
         result = solve_displib_instance(path)
         print(json.dumps(result, indent=2))
 
-
-import os
-import json
-
-# 设置你的 JSON 文件路径
-json_path = "/Users/wendyli/Downloads/displib_instances_testing/displib_instances_testing/displib_testinstances_swapping1.json"
-
-with open(json_path, "r") as f:
-    data = json.load(f)
-
-trains = data["trains"]
-
-for t_idx, train in enumerate(trains):
-    for o_idx, op in enumerate(train):
-        resources = op.get("resources", [])
-        for r in resources:
-            # 如果没有定义 release_time，则 r 可能只有 "resource" 字段
-            if "release_time" not in r:
-                print(f"Train {t_idx}, Operation {o_idx} 的资源 {r['resource']} 没有定义 release_time")
-            else:
-                print(f"Train {t_idx}, Operation {o_idx} 的资源 {r['resource']} 的 release_time = {r['release_time']}")
